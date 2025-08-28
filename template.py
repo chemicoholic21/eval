@@ -1198,6 +1198,25 @@ def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     final_df_data = []
     df.reset_index(drop=True, inplace=True) 
 
+    # --- Robust column name detection for 'Candidate Profile' and Notice Period ---
+    # Find the actual column name for 'Candidate Profile'
+    candidate_profile_col = None
+    for col in df.columns:
+        if col.strip().lower() == 'candidate profile' or 'candidate profile' in col.strip().lower():
+            candidate_profile_col = col
+            break
+    if not candidate_profile_col:
+        print("⚠️ 'Candidate Profile' column not found in input. Will use empty string as fallback.")
+
+    # Find the actual column name for Notice Period
+    notice_period_col = None
+    for col in df.columns:
+        if 'notice period' in col.strip().lower():
+            notice_period_col = col
+            break
+    if not notice_period_col:
+        print("⚠️ Notice Period column not found in input. Will use empty string as fallback.")
+
     for row_num, (index, row) in enumerate(df.iterrows()):
 
         profile_data = {}
@@ -1209,11 +1228,15 @@ def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             profile_data = {"error": f"Failed to parse profile JSON: {profile_json_str}"}
             print(f"Warning: Could not parse JSON for row {row_num}. Content: {profile_json_str}")
 
-        profile_markdown = row.get('Candidate Profile', '')
+        # Use robustly detected column for Candidate Profile
+        profile_markdown = row.get(candidate_profile_col, '') if candidate_profile_col else ''
         extracted_profile = extract_from_profile_markdown(profile_markdown)
         interview_highlights = profile_data.get('interview_highlights', 'N/A')
         if not interview_highlights or interview_highlights == 'N/A':
             interview_highlights = extracted_profile['interview_highlights']
+
+        # Use robustly detected column for Notice Period
+        notice_resume = row.get(notice_period_col, '') if notice_period_col else ''
         
         # If interview highlights are still not available or contain negative messages, create from resume
         if (not interview_highlights or interview_highlights == 'N/A' or 
@@ -1558,13 +1581,13 @@ def main():
         if COL_SRC_PHONE:
             dtype_dict[COL_SRC_PHONE] = str
 
-        df = pd.read_csv("25 Aug - PE preformat.csv", dtype=dtype_dict)
-        print(f"📄 Successfully loaded 'OP0.csv' with {len(df)} rows.")
+        df = pd.read_csv("CodeRabbit - productads.csv", dtype=dtype_dict)
+        print(f"📄 Successfully loaded 'CodeRabbit - productads.csv' with {len(df)} rows.")
 
         # Process the dataframe
         final_df = process_dataframe(df)
 
-        output_filename = "PE final ads.csv"
+        output_filename = "productads.csv"
         # Force quoting for phone numbers to ensure they appear with double quotes
         final_df.to_csv(output_filename, index=False, encoding='utf-8-sig', quoting=1, quotechar='"')
         print(f"\n🎉 Pipeline Complete! All results saved to '{output_filename}' in the correct format.")

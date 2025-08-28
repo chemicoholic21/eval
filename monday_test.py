@@ -417,9 +417,9 @@ def main():
     # --- Load Data ---
     try:
         # Prioritize CSV, then look for Excel
-        if os.path.exists("Coderabbitsre.csv"):
-            df = pd.read_csv("Coderabbitsre.csv")
-            print(f"📄 Successfully loaded 'Coderabbitsre.csv' with {len(df)} rows.")
+        if os.path.exists("Platform tech lead.csv"):
+            df = pd.read_csv("Platform tech lead.csv")
+            print(f"📄 Successfully loaded 'Platform tech lead.csv' with {len(df)} rows.")
         else:
             excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx')]
             if not excel_files:
@@ -493,7 +493,7 @@ def main():
         print("ℹ️ No candidates to profile, skipping merge step.")
 
     # --- Save Output ---
-    output_filename = "PE ads post eval.csv"
+    output_filename = "platform_posteval_ads.csv"
     try:
         df.to_csv(output_filename, index=False, encoding='utf-8-sig')
         print(f"\n🎉 Pipeline Complete! All results saved to '{output_filename}'.")
