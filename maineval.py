@@ -1,20 +1,28 @@
 import os
-import pandas as pd
-import google.generativeai as genai
-from dotenv import load_dotenv
+import sys
 import time
 import random
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import hashlib
 import threading
+import pandas as pd
 from functools import lru_cache
+from gemini_rest import gemini_generate_content
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 
+# --- RECRUITER GPT EVALUATION PROMPT ---
+@lru_cache(maxsize=1000)
+def create_recruiter_gpt_eval_prompt(recruiter_request, resume_text):
+    return f"""You are an expert AI recruiting assistant. Your task is to evaluate a candidate's resume based **only** on a single, high-priority request from a recruiter.\n\nAnalyze the resume provided below and determine if the candidate's resume text directly matches the recruiter's request.\n\nRecruiter Request: {recruiter_request}\nResume: {resume_text}\n\nOutput a short evaluation and a clear yes/no match statement."""
+
+## (rest of the script remains unchanged)
+
 # --- GLOBAL CONFIGURATION & SETUP ---
-print("🚀 Starting the UNIFIED Candidate Evaluation Pipeline...")
+print("Starting the UNIFIED Candidate Evaluation Pipeline...")
 PIPELINE_START_TIME = time.time()
 load_dotenv()
 
@@ -23,36 +31,45 @@ try:
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not found in .env file.")
-    genai.configure(api_key=GEMINI_API_KEY)
-    print("✅ Google Generative AI configured successfully.")
+    print("Google Generative AI API key loaded.")
 except Exception as e:
-    print(f"❌ FATAL ERROR: Could not configure Google Generative AI. Reason: {e}")
+    print(f"FATAL ERROR: Could not configure Google Generative AI. Reason: {e}")
     exit(1)
 
-# --- COLUMN NAME CONSTANTS ---
-# Define all column names here for easy management
+
+
+# --- COLUMN NAME CONSTANTS (MATCHING devops_plum - Sheet1.csv) ---
 # Input Columns
-COL_JOB_DESC = "Grapevine Job - Job → Description"
-COL_INTERVIEW = "Grapevine Aiinterviewinstance → Transcript → Conversation"
+COL_ID = "Grapevine Aiinterviewinstance → ID"
 COL_RESUME = "Grapevine Userresume - Resume → Metadata → Resume Text"
-COL_CRITERIA = "Recruiter GPT Response "
-COL_CANDIDATE_NAME = "Grapevine Userresume - Resume → Metadata → User Real Name"
-COL_COMPANY_NAME = "Title"
 COL_RESUME_URL = "Grapevine Userresume - Resume → Resume URL"
+COL_CANDIDATE_NAME = "Grapevine Userresume - Resume → Metadata → User Real Name"
+COL_DURATION = "Grapevine Aiinterviewinstance → Duration"
+COL_EXPERIENCE = "Grapevine Userresume - Resume → Metadata → Phone Number"
 COL_PHONE = "Grapevine Userresume - Resume → Metadata → Phone Number"
-COL_EMAIL = "Grapevine Userresume - Resume → Metadata → Email"
 COL_CTC = "Grapevine Userresume - Resume → Metadata → Current Salary"
-COL_EXPERIENCE = "Grapevine Userresume - Resume → Metadata → Experience"
-
-# Stage 1 Output Columns
-COL_INTERVIEW_EVAL = "Interview Evaluator Agent (RAG-LLM)"
+COL_EMAIL = "Grapevine Userresume - Resume → Metadata → Email"
 COL_RESUME_EVAL = "Resume Evaluator Agent (RAG-LLM)"
-COL_SUMMARIZER = "Resume + Interview Summarizer Agent"
-COL_RESULT = "Result[LLM]" # This column determines filtering
-
-# Stage 2 Output Columns
+# Read this column from input CSV, but rename it in output
+COL_SUMMARIZER_INPUT = "Resume + Interview Summarizer Agent"
+COL_SUMMARIZER = "Resume + RecruiterGPT Summarizer Agent"
+COL_RESULT = "Result[LLM]"
+COL_RECRUITER_GPT = "Recruiter GPT"
+COL_USER_ID = "Grapevine Aiinterviewinstance → User ID"
+COL_FINAL_DECISION = "Final Decision"
 COL_GOOD_FIT = "Good Fit"
 COL_PROFILE = "Candidate Profile"
+COL_NOTICE_PERIOD = "Grapevine Userresume - Resume → Metadata → Notice Period"
+COL_NOTICE_PERIOD_PREF = "User → User Settings → Round1 Preference → Notice Period"
+
+# Columns not present in this CSV are omitted.
+COL_GOOD_FIT = "Good Fit"
+COL_PROFILE = "Candidate Profile"
+
+
+# For compatibility in code logic (fallbacks for missing columns)
+COL_COMPANY_NAME = COL_CANDIDATE_NAME  # No company name column, fallback to candidate name
+COL_CRITERIA = COL_RECRUITER_GPT  # Use Recruiter GPT as criteria
 
 
 # --- ULTRA-FAST GEMINI PROCESSOR CLASS ---
@@ -76,16 +93,19 @@ class UltraFastGeminiProcessor:
         with _cache_lock:
             if cache_key in _response_cache:
                 self.cache_hits += 1
+                print(f"[CACHE HIT] Key: {cache_key}")
                 return _response_cache[cache_key]
-            return None
+            return ""
 
     def _set_cached_response(self, cache_key: str, response: str):
         with _cache_lock:
             _response_cache[cache_key] = response
+            print(f"[CACHE STORE] Key: {cache_key}")
 
     def _gemini_generate_single(self, model_name: str, prompt: str) -> str:
         """Optimized single API call with caching."""
         if not prompt or not prompt.strip():
+            print("[ERROR] Empty prompt provided.")
             return "Error: Empty prompt provided."
 
         cache_key = self._generate_cache_key(model_name, prompt)
@@ -98,47 +118,46 @@ class UltraFastGeminiProcessor:
         for attempt in range(max_retries + 1):
             try:
                 if attempt > 0:
+                    print(f"[RETRY] API call attempt {attempt+1} for key: {cache_key}")
                     time.sleep(random.uniform(0.5, 1.5))
-                
-                model = genai.GenerativeModel(model_name)
-                safety_settings = [
-                    {"category": c, "threshold": "BLOCK_NONE"}
-                    for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]
-                ]
-                response = model.generate_content(prompt, safety_settings=safety_settings)
-                
-                result = response.text.strip() if hasattr(response, 'text') and response.text else "Error: No response text"
-                
+                print(f"[API CALL] Model: {model_name}, Attempt: {attempt+1}, Key: {cache_key}")
+                # Use Gemini REST API helper
+                result = gemini_generate_content(GEMINI_API_KEY, prompt)
+                if result:
+                    result = result.strip()
+                else:
+                    result = "Error: No response text"
                 if self.cache_enabled:
                     self._set_cached_response(cache_key, result)
-                
                 self.api_call_count += 1
+                print(f"[API RESULT] Key: {cache_key}, Result: {str(result)[:80]}...")
                 return result
             except Exception as e:
+                print(f"[API ERROR] Attempt {attempt+1} failed for key: {cache_key}. Reason: {e}")
                 if attempt == max_retries:
                     return f"Error: API call failed after {max_retries} retries. Reason: {e}"
+        print(f"[ERROR] Max retries exceeded for key: {cache_key}")
         return "Error: Max retries exceeded"
 
     def process_prompts_in_parallel(self, model_name: str, prompts: List[str], task_description: str) -> List[str]:
         """Processes a list of prompts using a thread pool for high concurrency."""
         if not prompts:
+            print(f"[WARN] No prompts provided for {task_description}.")
             return []
-
-        print(f"🔥 Starting parallel processing for '{task_description}' ({len(prompts)} prompts)...")
+        print(f"[START] Parallel processing for '{task_description}' ({len(prompts)} prompts)...")
         results = [""] * len(prompts)
-        
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_index = {executor.submit(self._gemini_generate_single, model_name, prompt): i for i, prompt in enumerate(prompts)}
-            
-            with tqdm(as_completed(future_to_index), total=len(prompts), desc=f"⚡️ {task_description}") as progress_bar:
+            with tqdm(as_completed(future_to_index), total=len(prompts), desc=f"{task_description}") as progress_bar:
                 for future in progress_bar:
                     index = future_to_index[future]
                     try:
                         results[index] = future.result()
+                        print(f"[PROGRESS] {task_description}: Completed {index+1}/{len(prompts)}")
                     except Exception as e:
+                        print(f"[ERROR] {task_description}: Task {index+1} failed with exception: {e}")
                         results[index] = f"Error: Task failed with exception: {e}"
-        
-        print(f"✅ Completed '{task_description}'.")
+        print(f"[COMPLETE] '{task_description}'.")
         return results
 
 processor = UltraFastGeminiProcessor(max_workers=32, cache_enabled=True)
@@ -161,16 +180,17 @@ def create_resume_prompt(job_desc, resume, criteria):
 """
 
 @lru_cache(maxsize=1000)
-def create_interview_prompt(job_desc, transcript, criteria):
-    # This prompt is from your first script
-    return f"""Analyze the interview transcript to assess the candidate's 'Demonstrated Technical/Role Knowledge/Skills'.You are an AI interviewer. Only use the information provided in the transcript and job role. Never invent, assume, or add details. If information is missing, state this in your justification. Always output in the specified JSON format. 
+def create_recruitergpt_prompt(resume_text, criteria):
+    """
+    Generates a prompt for RecruiterGPT to evaluate a candidate's resume based only on a single, high-priority recruiter request.
+    """
+    return f"""You are an expert AI recruiting assistant. Your task is to evaluate a candidate's resume based **only** on a single, high-priority request from a recruiter.
 
+Analyze the resume provided below and determine if the candidate's resume text directly matches the recruiter's request. Only use the information provided in the resume. Never invent, assume, or add details. If information is missing, state this in your justification. Always output in the specified JSON format.
 
 *Input:*
-- Job Role: {job_desc}
-- Interview Transcript: {transcript}
+- Resume: {resume_text}
 - Job-Specific Criteria: {criteria}
-
 
 *Output your assessment as a JSON object with a 'value' (0-10) and 'justification'.*
 """
@@ -178,21 +198,21 @@ def create_interview_prompt(job_desc, transcript, criteria):
 
 
 @lru_cache(maxsize=1000)
-def create_summarizer_prompt(job_desc, resume_eval, interview_eval, criteria):
+def create_summarizer_prompt(job_desc, resume_eval, criteria):
     # This prompt is from your first script
     return f"""As an AI hiring coordinator, summarize the candidate's evaluation. Provide bullet points for key strengths, weaknesses, and a recommendation (advance/reject/manual intervention). Also, provide an 'Overall Recommendation Score' as a JSON object with a 'value' and 'justification'.
 
 *Input:*
 - Job Role: {job_desc}
 - Resume Evaluation: {resume_eval}
-- Interview Evaluation: {interview_eval}
+
 - Job-Specific Criteria: {criteria}
     
     
     **Decision Guidelines:**
 - "Advanced": Strong candidate with clear alignment to job requirements and good evaluation scores
 - "Reject": Clear mismatch with job requirements, poor evaluation scores, or significant concerns
-- "Manual Intervention": ONLY when there are conflicting signals, borderline scores, or insufficient data/ interview transcript to make a clear decision. 
+- "Manual Intervention": ONLY when there are conflicting signals, borderline scores, or insufficient data to make a clear decision. But they are from top product companies or startups or top universities/institutes.
 
     Consider matching keywords from the JD with the resume text in terms of Tech Stack, and role responsibilities to make a decision. Higher matches must be considered for "Advanced" and lower matches for "Reject". If the interview script is not enough, you can mark as "Manual Intervention".
    CRITICAL: DO NOT HALLUCINATE OR MAKE UP DATA. 
@@ -216,13 +236,14 @@ def create_good_fit_prompt(row_data: dict) -> str:
     """Creates the prompt for the 'Good Fit' summary, adapted from your second script."""
     candidate_name = row_data.get(COL_CANDIDATE_NAME, 'The Candidate')
     company_name = row_data.get(COL_COMPANY_NAME, 'the Company')
-    job_description = row_data.get(COL_JOB_DESC, '')
+    # Use the job description column from the DataFrame if present
+    job_description = row_data.get('Grapevine Job - Job → Description', '')
     resume_text = row_data.get(COL_RESUME, '')
-    
+
     # Handle potential NaN values
     if pd.isna(job_description) or pd.isna(resume_text):
         return "Error: Cannot generate summary because Job Description or Resume Text is missing."
-    
+
     # Convert to string if not already
     job_description = str(job_description) if job_description else ''
     resume_text = str(resume_text) if resume_text else ''
@@ -233,10 +254,9 @@ def create_good_fit_prompt(row_data: dict) -> str:
     # A simple way to get job title, can be improved
     job_title = "the Role"
     if 'title' in job_description.lower():
-        try:
-            job_title = re.search(r'title\s*:\s*(.*)', job_description, re.IGNORECASE).group(1).strip()
-        except AttributeError:
-            pass # Keep default
+        m = re.search(r'title\s*:\s*(.*)', job_description, re.IGNORECASE)
+        if m:
+            job_title = m.group(1).strip()
 
     first_name = str(candidate_name).split(' ')[0]
 
@@ -268,7 +288,7 @@ def create_candidate_profile_prompt(row_data: dict, good_fit_summary: str) -> st
 
     candidate_name = row_data.get(COL_CANDIDATE_NAME, "Not Provided")
     company_name = row_data.get(COL_COMPANY_NAME, "Not Provided")
-    job_description = row_data.get(COL_JOB_DESC, "")
+    job_description = ''  # No job description column in new CSV
     resume_text = row_data.get(COL_RESUME, "")
     resume_url = row_data.get(COL_RESUME_URL, "")
     phone = row_data.get(COL_PHONE, "Not Provided")
@@ -309,25 +329,25 @@ Good Fit Summary:
 
 Output requirements (plain text, ready to paste into Notion):
 1) Full Name (Current Role at Current Company)
-   (Degree, Institution | Degree, Institution) (Last Company)
-   Phone: {phone} | Email: {email} | Current CTC: {ctc}
-   Experience: {experience}
+    (Degree, Institution | Degree, Institution) (Last Company)
+    Phone: {phone} | Email: {email} | Current CTC: {ctc}
+    Experience: {experience}
 
 2) Why {first_name} for {job_title} at {company_name}:
-   1. [Clear, role-specific reason supported by evidence from resume or provided data]
-   2. [Clear, role-specific reason]
-   3. [Clear, role-specific reason]
-   4. [Clear, role-specific reason]
+    1. [Clear, role-specific reason supported by evidence from resume or provided data]
+    2. [Clear, role-specific reason]
+    3. [Clear, role-specific reason]
+    4. [Clear, role-specific reason]
 
 3) Technical Alignment:
-   - [Short bullets of relevant technical and soft skills]
+    - [Short bullets of relevant technical and soft skills]
 
 4) What Stood Out in the Interview:
-   - [Brief narrative or bullets; if transcript not available, base this on resume and JD]
+    - [Brief narrative or bullets; if transcript not available, base this on resume and JD]
 
 5) Links:
-   Resume: {resume_hyperlink}
-   LinkedIn: {linkedin_hyperlink}
+    Resume: {resume_hyperlink}
+    LinkedIn: {linkedin_hyperlink}
 
 6) One-sentence personalized summary of candidate fit.
 
@@ -336,60 +356,48 @@ Formatting rules:
 - Use clear line breaks and bullets as above.
 - Do NOT hallucinate or invent any numbers, colleges, companies, or names. If information is missing, state 'Not Provided'.
 """
-
     return prompt
 def run_initial_evaluations(df: pd.DataFrame) -> pd.DataFrame:
     """Runs Stage 1: Resume, Interview, Summary, and Verdict evaluations."""
     print("\n" + "="*25 + " STAGE 1: INITIAL EVALUATION " + "="*25)
-
+    print(f"[INFO] Running initial evaluation for {len(df)} candidates.")
     # --- Create Prompts ---
-    resume_prompts = [create_resume_prompt(r.get(COL_JOB_DESC, ""), r.get(COL_RESUME, ""), r.get(COL_CRITERIA, "")) for _, r in df.iterrows()]
-    interview_prompts = [create_interview_prompt(r.get(COL_JOB_DESC, ""), r.get(COL_INTERVIEW, ""), r.get(COL_CRITERIA, "")) if pd.notna(r.get(COL_INTERVIEW)) and r.get(COL_INTERVIEW, "").strip() else "" for _, r in df.iterrows()]
-
-    # --- Run Evaluations in Parallel ---
-    df[COL_RESUME_EVAL] = processor.process_prompts_in_parallel("gemini-2.5-pro", resume_prompts, "Resume Evaluations")
-
-    valid_interview_prompts = [p for p in interview_prompts if p]
-    interview_results_partial = processor.process_prompts_in_parallel("gemini-2.5-pro", valid_interview_prompts, "Interview Evaluations")
-
-    # Map interview results back
-    full_interview_results = [""] * len(df)
-    interview_result_idx = 0
-    for i in range(len(df)):
-        if interview_prompts[i]:
-            full_interview_results[i] = interview_results_partial[interview_result_idx]
-            interview_result_idx += 1
-        else:
-            full_interview_results[i] = "Interview not conducted or transcript unavailable."
-    df[COL_INTERVIEW_EVAL] = full_interview_results
-
-    # --- Create and Run Summarizer and Verdict ---
-    summarizer_prompts = [create_summarizer_prompt(row.get(COL_JOB_DESC, ""), row.get(COL_RESUME_EVAL, ""), row.get(COL_INTERVIEW_EVAL, ""), row.get(COL_CRITERIA, "")) for _, row in df.iterrows()]
-    df[COL_SUMMARIZER] = processor.process_prompts_in_parallel("gemini-2.5-pro", summarizer_prompts, "Summaries")
-
+    resume_prompts = [create_resume_prompt('', r.get(COL_RESUME, ''), r.get(COL_CRITERIA, '')) for _, r in df.iterrows()]
+    print(f"[INFO] Created {len(resume_prompts)} resume prompts.")
+    # No interview prompts or columns in this CSV
+    df[COL_RESUME_EVAL] = processor.process_prompts_in_parallel('gemini-2.5-pro', resume_prompts, 'Resume Evaluations')
+    print(f"[INFO] Resume evaluations complete.")
+    # No interview evaluation
+    summary_prompts = [create_summarizer_prompt('', row.get(COL_RESUME_EVAL, ''), row.get(COL_CRITERIA, '')) for _, row in df.iterrows()]
+    print(f"[INFO] Created {len(summary_prompts)} summary prompts.")
+    df[COL_SUMMARIZER] = processor.process_prompts_in_parallel('gemini-2.5-pro', summary_prompts, 'Summaries')
+    print(f"[INFO] Summaries complete.")
     verdict_prompts = [create_verdict_prompt(summary) for summary in df[COL_SUMMARIZER]]
-    df[COL_RESULT] = processor.process_prompts_in_parallel("gemini-2.5-flash", verdict_prompts, "Verdicts")
-
-    print("✅ STAGE 1: Initial Evaluation Complete.")
+    print(f"[INFO] Created {len(verdict_prompts)} verdict prompts.")
+    df[COL_RESULT] = processor.process_prompts_in_parallel('gemini-2.5-flash', verdict_prompts, 'Verdicts')
+    print('STAGE 1: Initial Evaluation Complete.')
     return df
 def run_detailed_profiling(df: pd.DataFrame) -> pd.DataFrame:
     """Runs Stage 2: 'Good Fit' and 'Candidate Profile' generation."""
     print("\n" + "="*25 + " STAGE 2: DETAILED PROFILING " + "="*25)
-
     if df.empty:
-        print("ℹ️ No candidates to process for detailed profiling. Skipping Stage 2.")
+        print("[INFO] No candidates to process for detailed profiling. Skipping Stage 2.")
         return pd.DataFrame(columns=[COL_GOOD_FIT, COL_PROFILE])
 
-    print(f"Found {len(df)} candidates for detailed profiling.")
+    print(f"[INFO] Found {len(df)} candidates for detailed profiling.")
 
     # --- Create and Run "Good Fit" ---
     row_data_list = [row.to_dict() for _, row in df.iterrows()]
     good_fit_prompts = [create_good_fit_prompt(data) for data in row_data_list]
+    print(f"[INFO] Created {len(good_fit_prompts)} good fit prompts.")
     good_fit_results = processor.process_prompts_in_parallel("gemini-2.5-pro", good_fit_prompts, "Good Fit Summaries")
+    print(f"[INFO] Good fit summaries complete.")
 
     # --- Create and Run "Candidate Profile" ---
     profile_prompts = [create_candidate_profile_prompt(row_data_list[i], good_fit_results[i]) for i in range(len(df))]
+    print(f"[INFO] Created {len(profile_prompts)} candidate profile prompts.")
     profile_results = processor.process_prompts_in_parallel("gemini-2.5-pro", profile_prompts, "Candidate Profiles")
+    print(f"[INFO] Candidate profiles complete.")
 
     # Clean up markdown code blocks and special characters from results
     cleaned_profiles = []
@@ -409,35 +417,72 @@ def run_detailed_profiling(df: pd.DataFrame) -> pd.DataFrame:
         COL_PROFILE: cleaned_profiles
     }, index=df.index)
 
-    print("✅ STAGE 2: Detailed Profiling Complete.")
+    print("STAGE 2: Detailed Profiling Complete.")
     return results_df
 # --- MAIN ORCHESTRATOR ---
 
 def main():
+    # ...existing code...
+    print("\n" + "="*25 + " MAIN PIPELINE START " + "="*25)
+    print("[DEBUG] Entered main() function.")
+    # --- Recruiter Gpt evaluation column ---
+    COL_RECRUITER_GPT_INPUT = 'Recruiter GPT'
+    COL_RECRUITER_GPT_EVAL = 'Recruiter Gpt evaluation'
+    global df
+    df = None
     # --- Load Data ---
+    input_path = None
+    output_path = None
+    if len(sys.argv) >= 3:
+        input_path = sys.argv[1]
+        output_path = sys.argv[2]
+    print(f"[DEBUG] input_path: {input_path}, output_path: {output_path}")
     try:
-        # Prioritize CSV, then look for Excel
-        if os.path.exists("Platform tech lead.csv"):
-            df = pd.read_csv("Platform tech lead.csv")
-            print(f"📄 Successfully loaded 'Platform tech lead.csv' with {len(df)} rows.")
+        if input_path:
+            print(f"[INFO] Loading input file: {input_path}")
+            df = pd.read_csv(input_path)
+            print(f"[INFO] Successfully loaded '{input_path}' with {len(df)} rows.")
+            # --- Always overwrite 'Recruiter GPT' column with Gemini 2.5 Flash evaluation ---
+            COL_RECRUITER_GPT = 'Recruiter GPT'
+            COL_RECRUITER_GPT_RESPONSE = 'Recruiter GPT Response'
+            if COL_RECRUITER_GPT_RESPONSE in df.columns and COL_RESUME in df.columns:
+                print(f"[INFO] Overwriting 'Recruiter GPT' column with Gemini 2.5 Flash evaluation...")
+                recruiter_gpt_fit_prompts = [
+                    f"""You are an expert AI recruiting assistant. Based on the recruiter's request and the candidate's resume, state if the candidate is fit for the role (yes/no) and provide a two-line explanation.\n\nRecruiter Request: {row[COL_RECRUITER_GPT_RESPONSE]}\nResume: {row[COL_RESUME]}\n\nOutput: 1. Fit for role: Yes/No 2. Two-line explanation."""
+                    for _, row in df.iterrows()
+                ]
+                recruiter_gpt_fit_results = processor.process_prompts_in_parallel(
+                    'gemini-2.5-flash', recruiter_gpt_fit_prompts, 'Recruiter GPT Fit Evaluation'
+                )
+                df[COL_RECRUITER_GPT] = recruiter_gpt_fit_results
+                print(f"[INFO] 'Recruiter GPT' column overwritten with fit evaluation.")
+                print("[DEBUG] Sample of 'Recruiter GPT' column after overwrite:")
+                print(df[['Recruiter GPT']].head(5))
         else:
-            excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx')]
-            if not excel_files:
-                raise FileNotFoundError("No 'correct - Sheet1.csv' or .xlsx file found.")
-            df = pd.read_excel(excel_files[0])
-            print(f"📄 Successfully loaded '{excel_files[0]}' with {len(df)} rows.")
+            print("[FATAL ERROR] No input file provided. Please specify an input CSV file as a command line argument.")
+            return
     except Exception as e:
-        print(f"❌ FATAL ERROR loading data: {e}")
+        print(f"[FATAL ERROR] loading data: {e}")
         return
+    # Print columns with non-ASCII characters replaced to avoid UnicodeEncodeError
+    safe_columns = [col.encode('ascii', 'replace').decode() for col in df.columns.tolist()]
+    print("[DEBUG] DataFrame loaded. Columns: ", safe_columns)
 
     # --- Title Case for Candidate Name ---
     if COL_CANDIDATE_NAME in df.columns:
+        print(f"[INFO] Title-casing candidate names.")
         df[COL_CANDIDATE_NAME] = df[COL_CANDIDATE_NAME].astype(str).apply(lambda x: x.title() if pd.notna(x) else x)
+    else:
+        print(f"[DEBUG] Column {COL_CANDIDATE_NAME.encode('ascii', 'replace').decode()} not found in DataFrame.")
     # --- Title Case Resume Text ---
     if COL_RESUME in df.columns:
+        print(f"[INFO] Title-casing resume text.")
         df[COL_RESUME] = df[COL_RESUME].astype(str).apply(lambda x: x.title() if pd.notna(x) else x)
+    else:
+        print(f"[DEBUG] Column {COL_RESUME.encode('ascii', 'replace').decode()} not found in DataFrame.")
     # --- Clean Phone Numbers: Remove +91/91 and keep last 10 digits ---
     if COL_PHONE in df.columns:
+        print(f"[INFO] Cleaning phone numbers.")
         def clean_phone(phone):
             if pd.isna(phone):
                 return phone
@@ -451,17 +496,51 @@ def main():
             # Return last 10 digits if available
             return phone_str[-10:] if len(phone_str) >= 10 else phone_str
         df[COL_PHONE] = df[COL_PHONE].apply(clean_phone)
-    """Main function to run the entire pipeline."""
-    # ...existing code...
+    else:
+        print(f"[DEBUG] Column {COL_PHONE.encode('ascii', 'replace').decode()} not found in DataFrame.")
+
+    # --- Add 'title' column from UI input (if provided as env or argument) ---
+    title_value = os.environ.get('TITLE_INPUT', None)
+    if len(sys.argv) > 3:
+        title_value = sys.argv[3]
+    if title_value and df is not None:
+        print(f"[INFO] Adding 'title' column to DataFrame with value: {title_value}")
+        df['title'] = title_value
+    else:
+        print(f"[DEBUG] Title value not set or DataFrame is None.")
 
     # --- Deduplicate by Resume Link (immediately after loading data) ---
     initial_rows = len(df)
+    print(f"[DEBUG] Deduplicating by {COL_RESUME_URL.encode('ascii', 'replace').decode()}...")
     df.drop_duplicates(subset=[COL_RESUME_URL], keep='first', inplace=True)
-    if (removed_count := initial_rows - len(df)) > 0:
-        print(f"🔍 Deduplication removed {removed_count} duplicate entries based on resume link.")
+    removed_count = initial_rows - len(df)
+    if removed_count > 0:
+        print(f"[INFO] Deduplication removed {removed_count} duplicate entries based on resume link.")
+    else:
+        print(f"[DEBUG] No duplicates found for {COL_RESUME_URL.encode('ascii', 'replace').decode()}.")
+
+    # --- Recruiter Gpt evaluation column ---
+    COL_RECRUITER_GPT_RESPONSE = 'Recruiter GPT Response'
+    COL_RECRUITER_GPT_EVAL = 'Recruiter Gpt evaluation'
+    if COL_RECRUITER_GPT_RESPONSE in df.columns and COL_RESUME in df.columns:
+        print(f"[INFO] Evaluating resumes for recruiter GPT response using Gemini 2.5 Flash...")
+        recruiter_gpt_prompts = [
+            f"""You are an expert AI recruiting assistant. Your task is to evaluate a candidate's resume based **only** on a single, high-priority request from a recruiter.\n\nAnalyze the resume provided below and determine if the candidate's resume text directly matches the recruiter's request.\n\nRecruiter Request: {row[COL_RECRUITER_GPT_RESPONSE]}\nResume: {row[COL_RESUME]}\n\nOutput a short evaluation (max 2 lines) and a clear yes/no match statement."""
+            for _, row in df.iterrows()
+        ]
+        print(f"[INFO] Created {len(recruiter_gpt_prompts)} recruiter GPT response prompts.")
+        recruiter_gpt_results = processor.process_prompts_in_parallel(
+            'gemini-2.5-flash', recruiter_gpt_prompts, 'Recruiter GPT Evaluation'
+        )
+        df[COL_RECRUITER_GPT_EVAL] = recruiter_gpt_results
+        print(f"[INFO] Recruiter Gpt evaluation (from response) complete.")
+    else:
+        print(f"[DEBUG] Skipping recruiter GPT evaluation: columns missing.")
 
     # --- Run Stage 1 ---
+    print("[DEBUG] Running initial evaluations...")
     df = run_initial_evaluations(df)
+    print("[DEBUG] Initial evaluations complete.")
 
     # --- Filter Rejected Candidates ---
     print("\n" + "="*25 + " FILTERING REJECTED CANDIDATES " + "="*25)
@@ -469,39 +548,69 @@ def main():
     # Normalize verdict text for reliable filtering
     df[COL_RESULT] = df[COL_RESULT].str.strip().str.title()
 
+    print("[DEBUG] Filtering rejected candidates...")
     non_rejected_df = df[df[COL_RESULT] != 'Reject'].copy()
 
-    print(f"Initial candidates: {initial_count}")
-    print(f"Candidates marked 'Rejected': {initial_count - len(non_rejected_df)}")
-    print(f"Candidates remaining for profiling ('Advanced' or 'Manual Intervention'): {len(non_rejected_df)}")
+    print(f"[INFO] Initial candidates: {initial_count}")
+    print(f"[INFO] Candidates marked 'Rejected': {initial_count - len(non_rejected_df)}")
+    print(f"[INFO] Candidates remaining for profiling ('Advanced' or 'Manual Intervention'): {len(non_rejected_df)}")
 
     # --- Run Stage 2 ---
     if not non_rejected_df.empty:
+        print("[DEBUG] Running detailed profiling...")
         detailed_profiles_df = run_detailed_profiling(non_rejected_df)
-        
         # --- Merge Results ---
         print("\n" + "="*25 + " MERGING RESULTS " + "="*25)
         # Initialize columns if they don't exist
         if COL_GOOD_FIT not in df.columns:
             df[COL_GOOD_FIT] = ""
             df[COL_PROFILE] = ""
-        
         # Update the main dataframe with the results from the detailed profiling stage
         df.update(detailed_profiles_df)
-        print("✅ Detailed profiles merged into the main dataset.")
+        print("[INFO] Detailed profiles merged into the main dataset.")
     else:
-        print("ℹ️ No candidates to profile, skipping merge step.")
+        print("[DEBUG] No candidates to profile, skipping merge step.")
 
     # --- Save Output ---
-    output_filename = "platform_posteval_ads.csv"
     try:
-        df.to_csv(output_filename, index=False, encoding='utf-8-sig')
-        print(f"\n🎉 Pipeline Complete! All results saved to '{output_filename}'.")
+        print(f"[DEBUG] Attempting to write output file...")
+        if output_path:
+            print(f"[INFO] Attempting to write output to: {output_path}")
+            print("[DEBUG] Sample of 'Recruiter GPT' column just before saving output file:")
+            print(df[['Recruiter GPT']].head(5))
+            df.to_csv(output_path, index=False, encoding='utf-8-sig')
+            if os.path.exists(output_path):
+                print(f"\n[INFO] Pipeline Complete! All results saved to '{output_path}'.")
+                # Play a loud sound when processing is complete (Windows only)
+                try:
+                    import winsound
+                    duration = 1000  # milliseconds
+                    freq = 1200      # Hz
+                    winsound.Beep(freq, duration)
+                except Exception as e:
+                    print(f"[WARN] Could not play sound: {e}")
+            else:
+                print(f"[ERROR] Output file was not created at '{output_path}'. Check for earlier errors.")
+        else:
+            output_filename = "platform_posteval_ads.csv"
+            print(f"[INFO] Attempting to write output to: {output_filename}")
+            df.to_csv(output_filename, index=False, encoding='utf-8-sig')
+            if os.path.exists(output_filename):
+                print(f"\n[INFO] Pipeline Complete! All results saved to '{output_filename}'.")
+                # Play a loud sound when processing is complete (Windows only)
+                try:
+                    import winsound
+                    duration = 1000  # milliseconds
+                    freq = 1200      # Hz
+                    winsound.Beep(freq, duration)
+                except Exception as e:
+                    print(f"[WARN] Could not play sound: {e}")
+            else:
+                print(f"[ERROR] Output file was not created at '{output_filename}'. Check for earlier errors.")
     except Exception as e:
-        print(f"❌ ERROR saving results: {e}")
-
+        print(f"[FATAL ERROR] Exception while saving results: {e}")
     total_time = time.time() - PIPELINE_START_TIME
-    print(f"⏱️ Total pipeline execution time: {total_time:.2f} seconds ({total_time/60:.2f} minutes).")
+    print(f"[INFO] Total pipeline execution time: {total_time:.2f} seconds ({total_time/60:.2f} minutes).")
 
 if __name__ == "__main__":
     from tqdm import tqdm
