@@ -400,12 +400,16 @@ def process():
     df['Grapevine Job - Job → Description'] = jobdesc
     df['Recruiter GPT Response '] = recruitergpt
     df.to_csv(input_path, index=False)
+    # Remove old processed.csv if it exists, to avoid confusion
+    if os.path.exists(output_path):
+        os.remove(output_path)
     script_map = {
         'maineval': 'maineval.py',
         'candidatep': 'candidatep.py',
         'template': 'template.py',
     }
     script = script_map.get(mode, 'maineval.py')
+    import traceback
     try:
         # Start progress
         with progress_lock:
@@ -437,11 +441,12 @@ def process():
                     log_queue.put(f'PROCESSING ERROR:\nReturn code: {e.returncode}\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}\n')
                     log_condition.notify_all()
             except Exception as ex:
+                tb = traceback.format_exc()
                 with progress_lock:
                     progress_state['progress'] = 1.0
                     progress_state['eta'] = ''
                 with log_condition:
-                    log_queue.put(f'UNEXPECTED ERROR: {ex}\n')
+                    log_queue.put(f'UNEXPECTED ERROR: {ex}\n{tb}\n')
                     log_condition.notify_all()
             finally:
                 with log_condition:
@@ -451,13 +456,22 @@ def process():
         t = threading.Thread(target=run_and_track)
         t.start()
         t.join()
+        # After thread completes, check if processed.csv was created
+        if not os.path.exists(output_path):
+            with log_condition:
+                log_queue.put('ERROR: processed.csv was not created by the script.\n')
+                log_queue.put(None)
+                log_condition.notify_all()
+            return "Processing failed: processed.csv was not created.", 500
         return jsonify({'success': True})
     except Exception as ex:
+        import traceback
+        tb = traceback.format_exc()
         with progress_lock:
             progress_state['progress'] = 1.0
             progress_state['eta'] = ''
         with log_condition:
-            log_queue.put(f'UNEXPECTED ERROR: {ex}\n')
+            log_queue.put(f'UNEXPECTED ERROR: {ex}\n{tb}\n')
             log_queue.put(None)
             log_condition.notify_all()
         return f"Unexpected error: {str(ex)}", 500
