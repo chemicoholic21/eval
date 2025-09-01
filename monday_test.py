@@ -150,6 +150,8 @@ processor = UltraFastGeminiProcessor(max_workers=32, cache_enabled=True)
 def create_resume_prompt(job_desc, resume, criteria):
     # This prompt is from your first script
     return f"""Analyze the provided resume against the job role and criteria. Output a JSON object evaluating 'Education and Company Pedigree', 'Skills & Specialties', 'Work Experience', 'Basic Contact Details', and 'Educational Background Details' on specified scales, including a justification for each. Also, provide a summary for 'Input on Job Specific Criteria'. You are an AI hiring manager. Follow the instructions exactly. Only use the information provided in the input. Never invent or assume details. If information is missing, state this in your justification. Always output in the specified JSON format. 
+
+
 *Input:*
 - Job Role: {job_desc}
 - Resume: {resume}
@@ -164,6 +166,7 @@ def create_resume_prompt(job_desc, resume, criteria):
 def create_interview_prompt(job_desc, transcript, criteria):
     # This prompt is from your first script
     return f"""Analyze the interview transcript to assess the candidate's 'Demonstrated Technical/Role Knowledge/Skills'.You are an AI interviewer. Only use the information provided in the transcript and job role. Never invent, assume, or add details. If information is missing, state this in your justification. Always output in the specified JSON format. 
+
 
 
 *Input:*
@@ -417,9 +420,9 @@ def main():
     # --- Load Data ---
     try:
         # Prioritize CSV, then look for Excel
-        if os.path.exists("Platform tech lead.csv"):
-            df = pd.read_csv("Platform tech lead.csv")
-            print(f"📄 Successfully loaded 'Platform tech lead.csv' with {len(df)} rows.")
+        if os.path.exists("Supahealth (01 sept) - Supahealth.csv"):
+            df = pd.read_csv("Supahealth (01 sept) - Supahealth.csv")
+            print(f"📄 Successfully loaded 'Supahealth (01 sept) - Supahealth.csv' with {len(df)} rows.")
         else:
             excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx')]
             if not excel_files:
@@ -493,7 +496,7 @@ def main():
         print("ℹ️ No candidates to profile, skipping merge step.")
 
     # --- Save Output ---
-    output_filename = "platform_posteval_ads.csv"
+    output_filename = "supahealth (01 sept) - supahealth posteval.csv"
     try:
         df.to_csv(output_filename, index=False, encoding='utf-8-sig')
         print(f"\n🎉 Pipeline Complete! All results saved to '{output_filename}'.")
